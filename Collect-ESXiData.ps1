@@ -30,7 +30,6 @@
 #>
 
 #Requires -Version 7.0
-#Requires -Modules VMware.PowerCLI
 
 [CmdletBinding()]
 param(
@@ -89,6 +88,13 @@ Examples:
 # Validate host file exists
 if (-not (Test-Path $HostFile -PathType Leaf)) {
     Write-Host "ERROR: Host file not found: $HostFile" -ForegroundColor Red
+    exit 1
+}
+
+# Check for VMware.PowerCLI module
+if (-not (Get-Module -ListAvailable -Name VMware.PowerCLI)) {
+    Write-Host "ERROR: VMware.PowerCLI module is not installed." -ForegroundColor Red
+    Write-Host "Install it with: Install-Module -Name VMware.PowerCLI -Scope CurrentUser" -ForegroundColor Yellow
     exit 1
 }
 
