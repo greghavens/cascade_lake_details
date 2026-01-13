@@ -1,0 +1,627 @@
+<#
+.SYNOPSIS
+    Collects hardware and configuration data from ESXi hosts via SSH.
+
+.DESCRIPTION
+    Connects to ESXi hosts via PowerCLI, enables SSH, runs diagnostic commands,
+    and outputs results to a CSV file with proper RFC 4180 quoting.
+
+.PARAMETER HostFile
+    Path to the input file containing ESXi hostnames or IP addresses (one per line).
+
+.PARAMETER ThrottleLimit
+    Number of concurrent hosts to process. Default: 10
+
+.PARAMETER Timeout
+    Seconds before giving up on SSH command. Default: 30
+
+.PARAMETER Retries
+    Number of retry attempts for failed hosts. Default: 2
+
+.PARAMETER OutputFile
+    Custom output CSV filename. Default: auto-generated with timestamp.
+
+.PARAMETER PreserveSSHState
+    If set, restore SSH to its original state instead of always disabling.
+
+.EXAMPLE
+    .\Collect-ESXiData.ps1 -HostFile .\hosts.txt
+    .\Collect-ESXiData.ps1 -HostFile .\hosts.txt -ThrottleLimit 5 -PreserveSSHState
+#>
+
+#Requires -Version 7.0
+#Requires -Modules VMware.PowerCLI
+
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [ValidateScript({ Test-Path $_ -PathType Leaf })]
+    [string]$HostFile,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 50)]
+    [int]$ThrottleLimit = 10,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(5, 300)]
+    [int]$Timeout = 30,
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(0, 10)]
+    [int]$Retries = 2,
+
+    [Parameter(Mandatory = $false)]
+    [string]$OutputFile,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$PreserveSSHState
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# SSH commands to execute on each host
+$SSHCommands = @(
+    'vmware -vl'
+    'esxcli network nic list'
+    'lspci -v |grep -i eth'
+    'lspci -v |grep -i net'
+    'lspci -p |grep -i qedentv'
+    'vsish -e get /hardware/bios/dmiInfo'
+    'vsish -e get /hardware/cpu/cpuModelName'
+    'vsish -e get /hardware/cpu/cpuInfo'
+    'esxcfg-scsidevs -a'
+    'esxcfg-scsidevs -A'
+    'esxcfg-scsidevs -c'
+)
+
+# Generate timestamp for filenames
+$Timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+# Set output and log file paths
+if (-not $OutputFile) {
+    $OutputFile = "esxi_inventory_$Timestamp.csv"
+}
+$LogFile = "esxi_collector_$Timestamp.log"
+
+# Thread-safe logging function using synchronized hashtable
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = 'INFO',
+        [string]$Hostname = '',
+        [hashtable]$SyncHash = $null
+    )
+
+    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    $hostPrefix = if ($Hostname) { "[$Hostname] " } else { '' }
+    $logEntry = "[$timestamp] [$Level] $hostPrefix$Message"
+
+    # Console output
+    switch ($Level) {
+        'ERROR' { Write-Host $logEntry -ForegroundColor Red }
+        'WARN'  { Write-Host $logEntry -ForegroundColor Yellow }
+        'SUCCESS' { Write-Host $logEntry -ForegroundColor Green }
+        default { Write-Host $logEntry }
+    }
+
+    # File output (thread-safe)
+    if ($SyncHash) {
+        $SyncHash.LogLock.EnterWriteLock()
+        try {
+            Add-Content -Path $SyncHash.LogFile -Value $logEntry
+        }
+        finally {
+            $SyncHash.LogLock.ExitWriteLock()
+        }
+    }
+    else {
+        Add-Content -Path $script:LogFile -Value $logEntry
+    }
+}
+
+# RFC 4180 compliant CSV field escaping
+function ConvertTo-CsvField {
+    param([string]$Value)
+
+    if ([string]::IsNullOrEmpty($Value)) {
+        return '""'
+    }
+
+    # Check if escaping is needed (contains comma, quote, or newline)
+    if ($Value -match '[,"\r\n]') {
+        # Escape quotes by doubling them and wrap in quotes
+        return '"' + ($Value -replace '"', '""') + '"'
+    }
+    return $Value
+}
+
+# Execute SSH command with timeout
+function Invoke-SSHCommand {
+    param(
+        [string]$Hostname,
+        [string]$Username,
+        [string]$Command,
+        [int]$TimeoutSeconds,
+        [hashtable]$SyncHash
+    )
+
+    $sshArgs = @(
+        '-o', 'StrictHostKeyChecking=no'
+        '-o', 'UserKnownHostsFile=/dev/null'
+        '-o', 'LogLevel=ERROR'
+        '-o', "ConnectTimeout=$TimeoutSeconds"
+        "$Username@$Hostname"
+        $Command
+    )
+
+    try {
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = 'ssh.exe'
+        $processInfo.Arguments = $sshArgs -join ' '
+        $processInfo.RedirectStandardOutput = $true
+        $processInfo.RedirectStandardError = $true
+        $processInfo.UseShellExecute = $false
+        $processInfo.CreateNoWindow = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $processInfo
+
+        $outputBuilder = [System.Text.StringBuilder]::new()
+        $errorBuilder = [System.Text.StringBuilder]::new()
+
+        $outputHandler = {
+            if (-not [string]::IsNullOrEmpty($EventArgs.Data)) {
+                [void]$Event.MessageData.AppendLine($EventArgs.Data)
+            }
+        }
+
+        $outputEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action $outputHandler -MessageData $outputBuilder
+        $errorEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action $outputHandler -MessageData $errorBuilder
+
+        [void]$process.Start()
+        $process.BeginOutputReadLine()
+        $process.BeginErrorReadLine()
+
+        $completed = $process.WaitForExit($TimeoutSeconds * 1000)
+
+        Unregister-Event -SourceIdentifier $outputEvent.Name
+        Unregister-Event -SourceIdentifier $errorEvent.Name
+
+        if (-not $completed) {
+            $process.Kill()
+            throw "SSH command timed out after $TimeoutSeconds seconds"
+        }
+
+        $output = $outputBuilder.ToString().TrimEnd()
+        $stderr = $errorBuilder.ToString().TrimEnd()
+
+        if ($process.ExitCode -ne 0 -and -not [string]::IsNullOrEmpty($stderr)) {
+            Write-Log -Message "SSH stderr for '$Command': $stderr" -Level 'WARN' -Hostname $Hostname -SyncHash $SyncHash
+        }
+
+        return $output
+    }
+    catch {
+        throw "SSH command failed: $_"
+    }
+}
+
+# Process a single host
+function Process-ESXiHost {
+    param(
+        [string]$Hostname,
+        [System.Management.Automation.PSCredential]$Credential,
+        [string[]]$Commands,
+        [int]$TimeoutSeconds,
+        [int]$MaxRetries,
+        [bool]$PreserveSSH,
+        [hashtable]$SyncHash
+    )
+
+    $result = [ordered]@{
+        Hostname = $Hostname
+        Success = $false
+    }
+
+    foreach ($cmd in $Commands) {
+        $result[$cmd] = ''
+    }
+
+    $viConnection = $null
+    $sshWasRunning = $false
+    $attempt = 0
+
+    while ($attempt -le $MaxRetries) {
+        $attempt++
+
+        try {
+            Write-Log -Message "Processing host (attempt $attempt/$($MaxRetries + 1))" -Hostname $Hostname -SyncHash $SyncHash
+
+            # Connect via PowerCLI
+            Write-Log -Message "Connecting via PowerCLI" -Hostname $Hostname -SyncHash $SyncHash
+            $viConnection = Connect-VIServer -Server $Hostname -Credential $Credential -ErrorAction Stop
+
+            # Get SSH service status
+            $sshService = Get-VMHostService -VMHost $Hostname | Where-Object { $_.Key -eq 'TSM-SSH' }
+            $sshWasRunning = $sshService.Running
+            Write-Log -Message "SSH service was $(if ($sshWasRunning) {'already running'} else {'not running'})" -Hostname $Hostname -SyncHash $SyncHash
+
+            # Enable SSH if needed
+            if (-not $sshWasRunning) {
+                Write-Log -Message "Starting SSH service" -Hostname $Hostname -SyncHash $SyncHash
+                $sshService | Start-VMHostService -Confirm:$false | Out-Null
+                Start-Sleep -Seconds 2  # Brief wait for service to fully start
+            }
+
+            # Execute SSH commands
+            $username = $Credential.UserName
+
+            foreach ($cmd in $Commands) {
+                Write-Log -Message "Executing: $cmd" -Hostname $Hostname -SyncHash $SyncHash
+                try {
+                    $output = Invoke-SSHCommand -Hostname $Hostname -Username $username -Command $cmd -TimeoutSeconds $TimeoutSeconds -SyncHash $SyncHash
+                    $result[$cmd] = $output
+                }
+                catch {
+                    Write-Log -Message "Command failed: $cmd - $_" -Level 'WARN' -Hostname $Hostname -SyncHash $SyncHash
+                    $result[$cmd] = "ERROR: $_"
+                }
+            }
+
+            $result.Success = $true
+            Write-Log -Message "Successfully collected data" -Level 'SUCCESS' -Hostname $Hostname -SyncHash $SyncHash
+            break  # Success, exit retry loop
+        }
+        catch {
+            $errorMsg = $_.Exception.Message
+
+            if ($errorMsg -match 'authentication|credential|password|login' -or $_.Exception.GetType().Name -match 'Auth') {
+                Write-Log -Message "Authentication failed: $errorMsg" -Level 'ERROR' -Hostname $Hostname -SyncHash $SyncHash
+                break  # Don't retry auth failures
+            }
+
+            if ($attempt -le $MaxRetries) {
+                Write-Log -Message "Attempt $attempt failed: $errorMsg. Retrying..." -Level 'WARN' -Hostname $Hostname -SyncHash $SyncHash
+                Start-Sleep -Seconds 5
+            }
+            else {
+                Write-Log -Message "All attempts failed: $errorMsg" -Level 'ERROR' -Hostname $Hostname -SyncHash $SyncHash
+            }
+        }
+        finally {
+            # Restore/disable SSH based on settings
+            if ($viConnection) {
+                try {
+                    $sshService = Get-VMHostService -VMHost $Hostname | Where-Object { $_.Key -eq 'TSM-SSH' }
+
+                    if ($PreserveSSH -and -not $sshWasRunning) {
+                        Write-Log -Message "Restoring SSH to original state (stopping)" -Hostname $Hostname -SyncHash $SyncHash
+                        $sshService | Stop-VMHostService -Confirm:$false | Out-Null
+                    }
+                    elseif (-not $PreserveSSH) {
+                        Write-Log -Message "Stopping SSH service (default behavior)" -Hostname $Hostname -SyncHash $SyncHash
+                        $sshService | Stop-VMHostService -Confirm:$false | Out-Null
+                    }
+                }
+                catch {
+                    Write-Log -Message "Failed to manage SSH service: $_" -Level 'WARN' -Hostname $Hostname -SyncHash $SyncHash
+                }
+
+                # Disconnect
+                try {
+                    Disconnect-VIServer -Server $viConnection -Confirm:$false | Out-Null
+                }
+                catch {
+                    Write-Log -Message "Failed to disconnect: $_" -Level 'WARN' -Hostname $Hostname -SyncHash $SyncHash
+                }
+            }
+        }
+    }
+
+    return $result
+}
+
+# Main execution
+try {
+    Write-Log -Message "=== ESXi Data Collection Started ===" -Level 'INFO'
+    Write-Log -Message "Host file: $HostFile" -Level 'INFO'
+    Write-Log -Message "Output file: $OutputFile" -Level 'INFO'
+    Write-Log -Message "Log file: $LogFile" -Level 'INFO'
+    Write-Log -Message "Throttle limit: $ThrottleLimit" -Level 'INFO'
+    Write-Log -Message "Timeout: $Timeout seconds" -Level 'INFO'
+    Write-Log -Message "Retries: $Retries" -Level 'INFO'
+    Write-Log -Message "Preserve SSH state: $PreserveSSHState" -Level 'INFO'
+
+    # Load hosts from file
+    $hosts = Get-Content -Path $HostFile | Where-Object { $_ -match '\S' } | ForEach-Object { $_.Trim() }
+
+    if ($hosts.Count -eq 0) {
+        throw "No hosts found in $HostFile"
+    }
+
+    Write-Log -Message "Loaded $($hosts.Count) host(s) from file" -Level 'INFO'
+
+    # Prompt for credentials
+    Write-Host "`nEnter credentials for ESXi hosts:" -ForegroundColor Cyan
+    $credential = Get-Credential -Message "Enter ESXi credentials (used for all hosts)"
+
+    if (-not $credential) {
+        throw "Credentials are required"
+    }
+
+    # Suppress PowerCLI certificate warnings
+    Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Confirm:$false -Scope Session | Out-Null
+    Set-PowerCLIConfiguration -ParticipateInCeip $false -Confirm:$false -Scope Session 2>$null | Out-Null
+
+    # Create thread-safe synchronized hashtable for logging
+    $syncHash = [hashtable]::Synchronized(@{
+        LogFile = $LogFile
+        LogLock = [System.Threading.ReaderWriterLockSlim]::new()
+    })
+
+    # Thread-safe collection for results
+    $results = [System.Collections.Concurrent.ConcurrentBag[object]]::new()
+
+    Write-Log -Message "Starting parallel processing of hosts" -Level 'INFO'
+
+    # Process hosts in parallel
+    $hosts | ForEach-Object -Parallel {
+        $hostname = $_
+        $cred = $using:credential
+        $cmds = $using:SSHCommands
+        $timeout = $using:Timeout
+        $retries = $using:Retries
+        $preserveSSH = $using:PreserveSSHState
+        $sync = $using:syncHash
+        $resultsBag = $using:results
+
+        # Import required module in parallel runspace
+        Import-Module VMware.PowerCLI -ErrorAction SilentlyContinue
+
+        # Define functions in parallel scope
+        function Write-Log {
+            param(
+                [string]$Message,
+                [string]$Level = 'INFO',
+                [string]$Hostname = '',
+                [hashtable]$SyncHash = $null
+            )
+
+            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $hostPrefix = if ($Hostname) { "[$Hostname] " } else { '' }
+            $logEntry = "[$timestamp] [$Level] $hostPrefix$Message"
+
+            switch ($Level) {
+                'ERROR' { Write-Host $logEntry -ForegroundColor Red }
+                'WARN'  { Write-Host $logEntry -ForegroundColor Yellow }
+                'SUCCESS' { Write-Host $logEntry -ForegroundColor Green }
+                default { Write-Host $logEntry }
+            }
+
+            if ($SyncHash) {
+                $SyncHash.LogLock.EnterWriteLock()
+                try {
+                    Add-Content -Path $SyncHash.LogFile -Value $logEntry
+                }
+                finally {
+                    $SyncHash.LogLock.ExitWriteLock()
+                }
+            }
+        }
+
+        function Invoke-SSHCommand {
+            param(
+                [string]$Hostname,
+                [string]$Username,
+                [string]$Command,
+                [int]$TimeoutSeconds,
+                [hashtable]$SyncHash
+            )
+
+            $sshArgs = @(
+                '-o', 'StrictHostKeyChecking=no'
+                '-o', 'UserKnownHostsFile=/dev/null'
+                '-o', 'LogLevel=ERROR'
+                '-o', "ConnectTimeout=$TimeoutSeconds"
+                "$Username@$Hostname"
+                $Command
+            )
+
+            try {
+                $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+                $processInfo.FileName = 'ssh.exe'
+                $processInfo.Arguments = $sshArgs -join ' '
+                $processInfo.RedirectStandardOutput = $true
+                $processInfo.RedirectStandardError = $true
+                $processInfo.UseShellExecute = $false
+                $processInfo.CreateNoWindow = $true
+
+                $process = New-Object System.Diagnostics.Process
+                $process.StartInfo = $processInfo
+
+                $outputBuilder = [System.Text.StringBuilder]::new()
+                $errorBuilder = [System.Text.StringBuilder]::new()
+
+                $outputHandler = {
+                    if (-not [string]::IsNullOrEmpty($EventArgs.Data)) {
+                        [void]$Event.MessageData.AppendLine($EventArgs.Data)
+                    }
+                }
+
+                $outputEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action $outputHandler -MessageData $outputBuilder
+                $errorEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action $outputHandler -MessageData $errorBuilder
+
+                [void]$process.Start()
+                $process.BeginOutputReadLine()
+                $process.BeginErrorReadLine()
+
+                $completed = $process.WaitForExit($TimeoutSeconds * 1000)
+
+                Unregister-Event -SourceIdentifier $outputEvent.Name
+                Unregister-Event -SourceIdentifier $errorEvent.Name
+
+                if (-not $completed) {
+                    $process.Kill()
+                    throw "SSH command timed out after $TimeoutSeconds seconds"
+                }
+
+                $output = $outputBuilder.ToString().TrimEnd()
+                $stderr = $errorBuilder.ToString().TrimEnd()
+
+                if ($process.ExitCode -ne 0 -and -not [string]::IsNullOrEmpty($stderr)) {
+                    Write-Log -Message "SSH stderr for '$Command': $stderr" -Level 'WARN' -Hostname $Hostname -SyncHash $SyncHash
+                }
+
+                return $output
+            }
+            catch {
+                throw "SSH command failed: $_"
+            }
+        }
+
+        # Process the host
+        $result = [ordered]@{
+            Hostname = $hostname
+            Success = $false
+        }
+
+        foreach ($cmd in $cmds) {
+            $result[$cmd] = ''
+        }
+
+        $viConnection = $null
+        $sshWasRunning = $false
+        $attempt = 0
+
+        while ($attempt -le $retries) {
+            $attempt++
+
+            try {
+                Write-Log -Message "Processing host (attempt $attempt/$($retries + 1))" -Hostname $hostname -SyncHash $sync
+
+                Write-Log -Message "Connecting via PowerCLI" -Hostname $hostname -SyncHash $sync
+                $viConnection = Connect-VIServer -Server $hostname -Credential $cred -ErrorAction Stop
+
+                $sshService = Get-VMHostService -VMHost $hostname | Where-Object { $_.Key -eq 'TSM-SSH' }
+                $sshWasRunning = $sshService.Running
+                Write-Log -Message "SSH service was $(if ($sshWasRunning) {'already running'} else {'not running'})" -Hostname $hostname -SyncHash $sync
+
+                if (-not $sshWasRunning) {
+                    Write-Log -Message "Starting SSH service" -Hostname $hostname -SyncHash $sync
+                    $sshService | Start-VMHostService -Confirm:$false | Out-Null
+                    Start-Sleep -Seconds 2
+                }
+
+                $username = $cred.UserName
+
+                foreach ($cmd in $cmds) {
+                    Write-Log -Message "Executing: $cmd" -Hostname $hostname -SyncHash $sync
+                    try {
+                        $output = Invoke-SSHCommand -Hostname $hostname -Username $username -Command $cmd -TimeoutSeconds $timeout -SyncHash $sync
+                        $result[$cmd] = $output
+                    }
+                    catch {
+                        Write-Log -Message "Command failed: $cmd - $_" -Level 'WARN' -Hostname $hostname -SyncHash $sync
+                        $result[$cmd] = "ERROR: $_"
+                    }
+                }
+
+                $result.Success = $true
+                Write-Log -Message "Successfully collected data" -Level 'SUCCESS' -Hostname $hostname -SyncHash $sync
+                break
+            }
+            catch {
+                $errorMsg = $_.Exception.Message
+
+                if ($errorMsg -match 'authentication|credential|password|login' -or $_.Exception.GetType().Name -match 'Auth') {
+                    Write-Log -Message "Authentication failed: $errorMsg" -Level 'ERROR' -Hostname $hostname -SyncHash $sync
+                    break
+                }
+
+                if ($attempt -le $retries) {
+                    Write-Log -Message "Attempt $attempt failed: $errorMsg. Retrying..." -Level 'WARN' -Hostname $hostname -SyncHash $sync
+                    Start-Sleep -Seconds 5
+                }
+                else {
+                    Write-Log -Message "All attempts failed: $errorMsg" -Level 'ERROR' -Hostname $hostname -SyncHash $sync
+                }
+            }
+            finally {
+                if ($viConnection) {
+                    try {
+                        $sshService = Get-VMHostService -VMHost $hostname | Where-Object { $_.Key -eq 'TSM-SSH' }
+
+                        if ($preserveSSH -and -not $sshWasRunning) {
+                            Write-Log -Message "Restoring SSH to original state (stopping)" -Hostname $hostname -SyncHash $sync
+                            $sshService | Stop-VMHostService -Confirm:$false | Out-Null
+                        }
+                        elseif (-not $preserveSSH) {
+                            Write-Log -Message "Stopping SSH service (default behavior)" -Hostname $hostname -SyncHash $sync
+                            $sshService | Stop-VMHostService -Confirm:$false | Out-Null
+                        }
+                    }
+                    catch {
+                        Write-Log -Message "Failed to manage SSH service: $_" -Level 'WARN' -Hostname $hostname -SyncHash $sync
+                    }
+
+                    try {
+                        Disconnect-VIServer -Server $viConnection -Confirm:$false | Out-Null
+                    }
+                    catch {
+                        Write-Log -Message "Failed to disconnect: $_" -Level 'WARN' -Hostname $hostname -SyncHash $sync
+                    }
+                }
+            }
+        }
+
+        $resultsBag.Add([PSCustomObject]$result)
+
+    } -ThrottleLimit $ThrottleLimit
+
+    Write-Log -Message "Parallel processing complete" -Level 'INFO'
+
+    # Convert results to array and sort by hostname
+    $allResults = $results.ToArray() | Sort-Object -Property Hostname
+
+    # Build CSV with RFC 4180 compliant formatting
+    $csvHeaders = @('Hostname') + $SSHCommands
+    $csvLines = [System.Collections.Generic.List[string]]::new()
+
+    # Add header row
+    $headerRow = ($csvHeaders | ForEach-Object { ConvertTo-CsvField -Value $_ }) -join ','
+    $csvLines.Add($headerRow)
+
+    # Add data rows
+    foreach ($result in $allResults) {
+        $rowValues = @(ConvertTo-CsvField -Value $result.Hostname)
+        foreach ($cmd in $SSHCommands) {
+            $rowValues += ConvertTo-CsvField -Value $result.$cmd
+        }
+        $csvLines.Add($rowValues -join ',')
+    }
+
+    # Write CSV file
+    $csvContent = $csvLines -join "`r`n"
+    Set-Content -Path $OutputFile -Value $csvContent -NoNewline
+
+    # Summary
+    $successCount = ($allResults | Where-Object { $_.Success }).Count
+    $failCount = $allResults.Count - $successCount
+
+    Write-Host "`n" -NoNewline
+    Write-Log -Message "=== Collection Complete ===" -Level 'INFO'
+    Write-Log -Message "Total hosts: $($allResults.Count)" -Level 'INFO'
+    Write-Log -Message "Successful: $successCount" -Level $(if ($successCount -gt 0) { 'SUCCESS' } else { 'INFO' })
+    Write-Log -Message "Failed: $failCount" -Level $(if ($failCount -gt 0) { 'WARN' } else { 'INFO' })
+    Write-Log -Message "Output saved to: $OutputFile" -Level 'INFO'
+    Write-Log -Message "Log saved to: $LogFile" -Level 'INFO'
+
+    # Cleanup
+    $syncHash.LogLock.Dispose()
+}
+catch {
+    Write-Log -Message "Fatal error: $_" -Level 'ERROR'
+    Write-Log -Message $_.ScriptStackTrace -Level 'ERROR'
+    exit 1
+}
