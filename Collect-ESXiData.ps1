@@ -280,16 +280,19 @@ function Process-ESXiHost {
             Write-Log -Message "Connecting via PowerCLI" -Hostname $Hostname -SyncHash $SyncHash
             $viConnection = Connect-VIServer -Server $Hostname -Credential $Credential -ErrorAction Stop
 
+            # Get the VMHost object (required for Get-VMHostService)
+            $vmHost = Get-VMHost -Server $viConnection
+
             # Get SSH service status
-            $sshService = Get-VMHostService -VMHost $Hostname | Where-Object { $_.Key -eq 'TSM-SSH' }
+            $sshService = Get-VMHostService -VMHost $vmHost | Where-Object { $_.Key -eq 'TSM-SSH' }
             $sshWasRunning = $sshService.Running
             Write-Log -Message "SSH service was $(if ($sshWasRunning) {'already running'} else {'not running'})" -Hostname $Hostname -SyncHash $SyncHash
 
             # Enable SSH if needed
             if (-not $sshWasRunning) {
                 Write-Log -Message "Starting SSH service" -Hostname $Hostname -SyncHash $SyncHash
-                $sshService | Start-VMHostService -Confirm:$false | Out-Null
-                Start-Sleep -Seconds 2  # Brief wait for service to fully start
+                Start-VMHostService -HostService $sshService -Confirm:$false | Out-Null
+                Start-Sleep -Seconds 3  # Brief wait for service to fully start
             }
 
             # Execute SSH commands
@@ -331,15 +334,18 @@ function Process-ESXiHost {
             # Restore/disable SSH based on settings
             if ($viConnection) {
                 try {
-                    $sshService = Get-VMHostService -VMHost $Hostname | Where-Object { $_.Key -eq 'TSM-SSH' }
+                    $vmHostCleanup = Get-VMHost -Server $viConnection -ErrorAction SilentlyContinue
+                    if ($vmHostCleanup) {
+                        $sshServiceCleanup = Get-VMHostService -VMHost $vmHostCleanup | Where-Object { $_.Key -eq 'TSM-SSH' }
 
-                    if ($PreserveSSH -and -not $sshWasRunning) {
-                        Write-Log -Message "Restoring SSH to original state (stopping)" -Hostname $Hostname -SyncHash $SyncHash
-                        $sshService | Stop-VMHostService -Confirm:$false | Out-Null
-                    }
-                    elseif (-not $PreserveSSH) {
-                        Write-Log -Message "Stopping SSH service (default behavior)" -Hostname $Hostname -SyncHash $SyncHash
-                        $sshService | Stop-VMHostService -Confirm:$false | Out-Null
+                        if ($PreserveSSH -and -not $sshWasRunning) {
+                            Write-Log -Message "Restoring SSH to original state (stopping)" -Hostname $Hostname -SyncHash $SyncHash
+                            Stop-VMHostService -HostService $sshServiceCleanup -Confirm:$false | Out-Null
+                        }
+                        elseif (-not $PreserveSSH) {
+                            Write-Log -Message "Stopping SSH service (default behavior)" -Hostname $Hostname -SyncHash $SyncHash
+                            Stop-VMHostService -HostService $sshServiceCleanup -Confirm:$false | Out-Null
+                        }
                     }
                 }
                 catch {
@@ -541,14 +547,17 @@ try {
                 Write-Log -Message "Connecting via PowerCLI" -Hostname $hostname -SyncHash $sync
                 $viConnection = Connect-VIServer -Server $hostname -Credential $cred -ErrorAction Stop
 
-                $sshService = Get-VMHostService -VMHost $hostname | Where-Object { $_.Key -eq 'TSM-SSH' }
+                # Get the VMHost object (required for Get-VMHostService)
+                $vmHost = Get-VMHost -Server $viConnection
+
+                $sshService = Get-VMHostService -VMHost $vmHost | Where-Object { $_.Key -eq 'TSM-SSH' }
                 $sshWasRunning = $sshService.Running
                 Write-Log -Message "SSH service was $(if ($sshWasRunning) {'already running'} else {'not running'})" -Hostname $hostname -SyncHash $sync
 
                 if (-not $sshWasRunning) {
                     Write-Log -Message "Starting SSH service" -Hostname $hostname -SyncHash $sync
-                    $sshService | Start-VMHostService -Confirm:$false | Out-Null
-                    Start-Sleep -Seconds 2
+                    Start-VMHostService -HostService $sshService -Confirm:$false | Out-Null
+                    Start-Sleep -Seconds 3
                 }
 
                 $username = $cred.UserName
@@ -588,15 +597,18 @@ try {
             finally {
                 if ($viConnection) {
                     try {
-                        $sshService = Get-VMHostService -VMHost $hostname | Where-Object { $_.Key -eq 'TSM-SSH' }
+                        $vmHostCleanup = Get-VMHost -Server $viConnection -ErrorAction SilentlyContinue
+                        if ($vmHostCleanup) {
+                            $sshServiceCleanup = Get-VMHostService -VMHost $vmHostCleanup | Where-Object { $_.Key -eq 'TSM-SSH' }
 
-                        if ($preserveSSH -and -not $sshWasRunning) {
-                            Write-Log -Message "Restoring SSH to original state (stopping)" -Hostname $hostname -SyncHash $sync
-                            $sshService | Stop-VMHostService -Confirm:$false | Out-Null
-                        }
-                        elseif (-not $preserveSSH) {
-                            Write-Log -Message "Stopping SSH service (default behavior)" -Hostname $hostname -SyncHash $sync
-                            $sshService | Stop-VMHostService -Confirm:$false | Out-Null
+                            if ($preserveSSH -and -not $sshWasRunning) {
+                                Write-Log -Message "Restoring SSH to original state (stopping)" -Hostname $hostname -SyncHash $sync
+                                Stop-VMHostService -HostService $sshServiceCleanup -Confirm:$false | Out-Null
+                            }
+                            elseif (-not $preserveSSH) {
+                                Write-Log -Message "Stopping SSH service (default behavior)" -Hostname $hostname -SyncHash $sync
+                                Stop-VMHostService -HostService $sshServiceCleanup -Confirm:$false | Out-Null
+                            }
                         }
                     }
                     catch {
