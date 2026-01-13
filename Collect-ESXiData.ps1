@@ -58,12 +58,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$ScriptVersion = "1.2.0"
+
+# Always print version at startup
+Write-Host "`nESXi SSH Data Collection Script v$ScriptVersion" -ForegroundColor Cyan
+
 # Validate required parameter and show usage if missing
 if (-not $HostFile) {
     Write-Host @"
-
-ESXi SSH Data Collection Script
-================================
 
 Usage: .\Collect-ESXiData.ps1 -HostFile <path> [options]
 
@@ -546,18 +548,43 @@ try {
 
                 Write-Log -Message "Connecting via PowerCLI" -Hostname $hostname -SyncHash $sync
                 $viConnection = Connect-VIServer -Server $hostname -Credential $cred -ErrorAction Stop
+                Write-Log -Message "Connected successfully to VI server" -Hostname $hostname -SyncHash $sync
 
                 # Get the VMHost object (required for Get-VMHostService)
+                Write-Log -Message "Getting VMHost object..." -Hostname $hostname -SyncHash $sync
                 $vmHost = Get-VMHost -Server $viConnection
+                Write-Log -Message "VMHost: $($vmHost.Name), ConnectionState: $($vmHost.ConnectionState), PowerState: $($vmHost.PowerState)" -Hostname $hostname -SyncHash $sync
 
-                $sshService = Get-VMHostService -VMHost $vmHost | Where-Object { $_.Key -eq 'TSM-SSH' }
-                $sshWasRunning = $sshService.Running
-                Write-Log -Message "SSH service was $(if ($sshWasRunning) {'already running'} else {'not running'})" -Hostname $hostname -SyncHash $sync
+                # Get all services and find SSH
+                Write-Log -Message "Getting VMHost services..." -Hostname $hostname -SyncHash $sync
+                $allServices = Get-VMHostService -VMHost $vmHost
+                Write-Log -Message "Found $($allServices.Count) services" -Hostname $hostname -SyncHash $sync
+
+                $sshService = $allServices | Where-Object { $_.Key -eq 'TSM-SSH' }
+                if (-not $sshService) {
+                    Write-Log -Message "ERROR: TSM-SSH service not found! Available services: $($allServices.Key -join ', ')" -Level 'ERROR' -Hostname $hostname -SyncHash $sync
+                    throw "TSM-SSH service not found on host"
+                }
+
+                Write-Log -Message "SSH Service details - Key: $($sshService.Key), Label: $($sshService.Label), Running: $($sshService.Running), Policy: $($sshService.Policy)" -Hostname $hostname -SyncHash $sync
+
+                $sshWasRunning = [bool]$sshService.Running
+                Write-Log -Message "SSH service Running property value: '$($sshService.Running)' (type: $($sshService.Running.GetType().Name)), evaluated as: $sshWasRunning" -Hostname $hostname -SyncHash $sync
 
                 if (-not $sshWasRunning) {
-                    Write-Log -Message "Starting SSH service" -Hostname $hostname -SyncHash $sync
-                    Start-VMHostService -HostService $sshService -Confirm:$false | Out-Null
+                    Write-Log -Message "Starting SSH service..." -Hostname $hostname -SyncHash $sync
+                    $startResult = Start-VMHostService -HostService $sshService -Confirm:$false
+                    Write-Log -Message "Start-VMHostService returned: Running=$($startResult.Running)" -Hostname $hostname -SyncHash $sync
                     Start-Sleep -Seconds 3
+
+                    # Verify SSH actually started
+                    $sshServiceAfter = Get-VMHostService -VMHost $vmHost | Where-Object { $_.Key -eq 'TSM-SSH' }
+                    Write-Log -Message "After start - SSH Running: $($sshServiceAfter.Running)" -Hostname $hostname -SyncHash $sync
+                    if (-not $sshServiceAfter.Running) {
+                        Write-Log -Message "WARNING: SSH service may not have started properly!" -Level 'WARN' -Hostname $hostname -SyncHash $sync
+                    }
+                } else {
+                    Write-Log -Message "SSH service is already running, skipping start" -Hostname $hostname -SyncHash $sync
                 }
 
                 $username = $cred.UserName
