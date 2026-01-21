@@ -20,9 +20,9 @@ Create a PowerShell 7+ script that collects hardware and configuration data from
    - `vsish -e get /hardware/cpu/cpuModelName`
    - `vsish -e get /hardware/cpu/cpuInfo`
    - `vsish -e get /memory/comprehensive`
-   - `esxcfg-scsidevs -a`
    - `esxcfg-scsidevs -A`
    - `esxcfg-scsidevs -c`
+   - `esxcli storage core adapter list`
    - `esxcli network nic list`
    - `lspci -v |grep -i Ethernet -A2`
 
@@ -30,7 +30,7 @@ Create a PowerShell 7+ script that collects hardware and configuration data from
 
 After running the static commands, parse the output to discover drivers and run additional `lspci` commands:
 
-1. **Storage Drivers**: Parse `esxcfg-scsidevs -a` output to extract driver names from the "Driver" column, then run `lspci -p |grep -i <driver>` for each unique driver found.
+1. **Storage Drivers**: Parse `esxcli storage core adapter list` output to extract driver names from the "Driver" column, then run `lspci -p |grep -i <driver>` for each unique driver found.
 
 2. **Network Drivers**: Parse `esxcli network nic list` output to extract driver names from the "Driver" column, then run `lspci -p |grep -i <driver>` for each unique driver found.
 
@@ -52,9 +52,9 @@ After running the static commands, parse the output to discover drivers and run 
 | `vsish -e get /hardware/cpu/cpuModelName` | CPU model name |
 | `vsish -e get /hardware/cpu/cpuInfo` | CPU details |
 | `vsish -e get /memory/comprehensive` | Memory information |
-| `esxcfg-scsidevs -a` | SCSI adapters |
 | `esxcfg-scsidevs -A` | SCSI adapter details |
 | `esxcfg-scsidevs -c` | SCSI device paths |
+| `esxcli storage core adapter list` | Storage adapters with driver names |
 | `esxcli network nic list` | Network adapters |
 | `lspci -v \|grep -i Ethernet -A2` | PCI Ethernet device details |
 | `lspci_output` | **Combined output** of all dynamic `lspci -p` commands for both storage and network drivers, with each command and its output clearly labeled |

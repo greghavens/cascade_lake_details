@@ -58,7 +58,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = "1.5.0"
+$ScriptVersion = "1.5.2"
 
 # Always print version at startup
 Write-Host "`nESXi SSH Data Collection Script v$ScriptVersion" -ForegroundColor Cyan
@@ -114,15 +114,15 @@ $SSHCommands = @(
     'vsish -e get /hardware/cpu/cpuModelName'
     'vsish -e get /hardware/cpu/cpuInfo'
     'vsish -e get /memory/comprehensive'
-    'esxcfg-scsidevs -a'
     'esxcfg-scsidevs -A'
     'esxcfg-scsidevs -c'
+    'esxcli storage core adapter list'
     'esxcli network nic list'
     'lspci -v |grep -i Ethernet -A2'
 )
 
 # Commands whose output is used for driver discovery
-$StorageDriverCmd = 'esxcfg-scsidevs -a'
+$StorageDriverCmd = 'esxcli storage core adapter list'
 $NetworkDriverCmd = 'esxcli network nic list'
 
 # Generate timestamp for filenames
@@ -381,18 +381,36 @@ try {
                     $lspciOutputParts = [System.Collections.Generic.List[string]]::new()
                     $discoveredDrivers = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
-                    # Parse storage drivers from esxcfg-scsidevs -a output
-                    # Format: vmhbaX  driver_name  link_info  device_info  uid
+                    # Parse storage drivers from esxcli storage core adapter list output
+                    # Format: HBA Name  Driver  Link State  UID  ...  (with header row)
                     $storageOutput = $result[$storageDriverCmd]
                     if ($storageOutput -and $storageOutput -notmatch '^ERROR:') {
                         $storageLines = $storageOutput -split "`n" | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*$' }
+                        $headerFound = $false
+                        $driverColIndex = -1
                         foreach ($line in $storageLines) {
-                            # Split on whitespace, driver is typically the second column
-                            $fields = $line -split '\s+' | Where-Object { $_ }
-                            if ($fields.Count -ge 2) {
-                                $driver = $fields[1]
-                                # Skip header line or invalid entries
-                                if ($driver -and $driver -ne 'Driver' -and $driver -notmatch '^-+$') {
+                            if (-not $headerFound) {
+                                # Look for header line containing "Driver"
+                                if ($line -match 'Driver') {
+                                    $headerFound = $true
+                                    # Find column index for Driver (split by two or more spaces)
+                                    $headerParts = $line -split '\s{2,}'
+                                    for ($i = 0; $i -lt $headerParts.Count; $i++) {
+                                        if ($headerParts[$i] -match '^Driver$') {
+                                            $driverColIndex = $i
+                                            break
+                                        }
+                                    }
+                                }
+                                continue
+                            }
+                            # Skip separator lines
+                            if ($line -match '^[-\s]+$') { continue }
+                            # Parse data line
+                            $fields = $line -split '\s{2,}' | Where-Object { $_ }
+                            if ($fields.Count -gt $driverColIndex -and $driverColIndex -ge 0) {
+                                $driver = $fields[$driverColIndex].Trim()
+                                if ($driver -and $driver -notmatch '^-+$') {
                                     [void]$discoveredDrivers.Add($driver)
                                 }
                             }

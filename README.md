@@ -72,9 +72,9 @@ The script collects the following information from each ESXi host:
 | `vsish -e get /hardware/cpu/cpuModelName` | CPU model name |
 | `vsish -e get /hardware/cpu/cpuInfo` | CPU details |
 | `vsish -e get /memory/comprehensive` | Memory information |
-| `esxcfg-scsidevs -a` | SCSI adapters |
 | `esxcfg-scsidevs -A` | SCSI adapter details |
 | `esxcfg-scsidevs -c` | SCSI device paths |
+| `esxcli storage core adapter list` | Storage adapters with driver names |
 | `esxcli network nic list` | Network adapters |
 | `lspci -v \|grep -i Ethernet -A2` | PCI Ethernet device details |
 
@@ -82,7 +82,7 @@ The script collects the following information from each ESXi host:
 
 After running the static commands, the script automatically:
 
-1. Parses `esxcfg-scsidevs -a` output to discover storage driver names
+1. Parses `esxcli storage core adapter list` output to discover storage driver names
 2. Parses `esxcli network nic list` output to discover network driver names
 3. Runs `lspci -p |grep -i <driver>` for each unique driver found
 
@@ -160,4 +160,4 @@ Reduce the throttle limit:
 
 ## Version
 
-Current version: **1.5.0**
+Current version: **1.5.2**
