@@ -1,6 +1,6 @@
 # ESXi SSH Data Collection Script
 
-A PowerShell 7+ script that collects hardware and configuration data from multiple ESXi hosts via SSH for VMware Technical Qualification submissions.
+A PowerShell 7+ script that collects hardware and configuration data from multiple ESXi hosts via SSH.
 
 ## Requirements
 
